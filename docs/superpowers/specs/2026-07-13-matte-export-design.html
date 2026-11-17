@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2026-07-13-matte-export-design</title><style>
+:root { color-scheme: light dark; }
+body {
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  max-width: 860px; margin: 0 auto; padding: 3rem 1.5rem 6rem;
+  color: #1a1a1a; background: #fbfbfa;
+}
+@media (prefers-color-scheme: dark) {
+  body { color: #e6e6e6; background: #16171a; }
+  code, pre { background: #22242a !important; }
+  th { background: #22242a !important; }
+  tr:nth-child(even) td { background: #1c1e22 !important; }
+  a { color: #7db4ff; }
+  blockquote { color: #aaa; border-color: #3a3d44; }
+}
+h1 { font-size: 2rem; border-bottom: 2px solid #e2624222; padding-bottom: .3rem; }
+h2 { font-size: 1.4rem; margin-top: 2.4rem; border-bottom: 1px solid #8884; padding-bottom: .25rem; }
+h3 { font-size: 1.12rem; margin-top: 1.8rem; }
+code { font: 13.5px/1.5 "SF Mono", ui-monospace, Menlo, monospace; background: #f0f0ee; padding: .12em .4em; border-radius: 4px; }
+pre { background: #f0f0ee; padding: 1rem 1.1rem; border-radius: 8px; overflow-x: auto; border: 1px solid #0001; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 14.5px; }
+th, td { border: 1px solid #8883; padding: .5rem .7rem; text-align: left; vertical-align: top; }
+th { background: #f2f2f0; }
+tr:nth-child(even) td { background: #f7f7f5; }
+blockquote { margin: 1rem 0; padding: .2rem 1rem; border-left: 3px solid #e26242; color: #555; }
+hr { border: none; border-top: 1px solid #8883; margin: 2rem 0; }
+</style></head>
+<body><h1 id="design-luma-matte-export-mode-mode-matte">Design: Luma-Matte Export Mode (<code>--mode matte</code>)</h1>
+<p><strong>Date:</strong> 2026-07-13
+<strong>Status:</strong> Approved, pending implementation
+<strong>Component:</strong> <code>blur_plates.py</code> (and <code>batch_blur.py</code> by inheritance)</p>
+<h2 id="problem">Problem</h2>
+<p>The current pipeline bakes the redaction (blur / colour / image) directly into a
+full re-encode of <strong>every</strong> frame. For a high-fidelity editorial workflow this has
+two costs:</p>
+<ol>
+<li><strong>Quality loss on the master.</strong> The decode path pipes frames as 8-bit <code>bgr24</code>
+   and the output is HEVC <code>yuv420p</code> (<code>blur_plates.py:795</code>, <code>:956</code>/<code>:966</code>). Feeding a
+   high-fidelity master (e.g. a 4K ProRes HQ intermediate) through this transcodes the
+   <strong>entire frame</strong> to 8-bit 4:2:0 HEVC — the untouched parts of the picture are not
+   preserved, and the result no longer ingests natively into a ProRes-based
+   Premiere/DaVinci edit.</li>
+<li><strong>No way to composite the blur yourself.</strong> There is no output that lets an editor
+   keep the original footage pristine and apply the redaction in their own NLE/grade.</li>
+</ol>
+<h2 id="goal">Goal</h2>
+<p>Add a mode that detects and tracks plates exactly as today, but instead of altering
+the footage, <strong>exports a luma matte</strong> (white plates on black) as a ProRes <code>.mov</code>. The
+editor keeps the original ProRes untouched and drives a blur/mosaic through the matte
+in Premiere (Track Matte Key) or DaVinci (external matte / Matte node). This gives:</p>
+<ul>
+<li><strong>Zero quality loss</strong> on the actual footage (it is never re-encoded).</li>
+<li><strong>Native ProRes</strong> ingest, matched frame-for-frame to the source.</li>
+<li><strong>Faster</strong> runs than a blur pass (see Non-Goals / performance note).</li>
+</ul>
+<h2 id="decisions-locked-during-brainstorming">Decisions (locked during brainstorming)</h2>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Choice</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Matte type</td>
+<td><strong>Luma matte</strong> — white plates on black, ProRes 422</td>
+<td>Most universal; works as a Premiere Track Matte Key (luma) and a DaVinci external matte everywhere.</td>
+</tr>
+<tr>
+<td>Edge treatment</td>
+<td><strong>Hard edges by default</strong>, optional <code>--matte-feather N</code></td>
+<td>Editor controls softness in the NLE; feather flag available when baking is convenient.</td>
+</tr>
+<tr>
+<td>Encoder</td>
+<td><strong><code>prores_videotoolbox</code>, profile HQ</strong> when available (Apple platforms), auto-fallback to CPU <code>prores_ks</code></td>
+<td>Hardware ProRes via VideoToolbox is fast and low-power on Apple Silicon; <code>prores_ks</code> is the portable CPU path everywhere else. HQ keeps hard matte edges clean.</td>
+</tr>
+<tr>
+<td>Colour range</td>
+<td><strong>Full range (<code>-color_range pc</code>)</strong></td>
+<td>Ensures white encodes as true 255 (not limited-range 235) for a clean key. Source colorimetry is intentionally <em>not</em> copied for the matte.</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>Matte mode outputs <strong>only</strong> the matte</td>
+<td>No blur baked in, no audio, no sidecar, no alpha/4444.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cli-surface">CLI Surface</h2>
+<ul>
+<li>Extend <code>--mode</code> choices from <code>{blur, color, image}</code> to <code>{blur, color, image, matte}</code>.</li>
+<li>New flag <code>--matte-feather N</code> (int, default <code>0</code>): Gaussian falloff width in pixels
+  applied to the matte after boxes are drawn. <code>0</code> = hard edges.</li>
+<li>New flag <code>--matte-codec {prores, hevc}</code> (default <code>prores</code>): choice of matte encoder.</li>
+<li><code>prores</code> → ProRes 422 HQ in a <code>.mov</code> (see Encode Path). Best quality/edge fidelity;
+    hardware-accelerated only on Apple platforms, CPU (<code>prores_ks</code>) everywhere else.</li>
+<li><code>hevc</code> → near-lossless HEVC in an <code>.mp4</code>, GPU-accelerated via <code>hevc_nvenc</code> where
+    available (NVIDIA), CPU <code>libx265</code> fallback. This is the <strong>performance escape hatch</strong>
+    for PC/NVIDIA users where CPU ProRes is too slow. A luma matte survives HEVC well:
+    the signal lives entirely in luma, chroma is flat/neutral so 4:2:0 subsampling is
+    effectively lossless there, and only white/black edge crispness matters — which a
+    near-lossless CRF preserves cleanly.</li>
+<li>All existing detection/tracking flags are reused unchanged and honoured by the
+  matte: <code>--vehicles</code>, <code>--plate-conf</code>, <code>--plate-conf-in-vehicle</code>, <code>--conf</code>,
+  <code>--own-plate</code>, <code>--start</code>/<code>--end</code>, padding, SAHI settings, and tracking gap-fill.
+  The matte covers the exact same regions a blur run would have redacted.</li>
+<li>Output extension: the container is dictated by <code>--matte-codec</code> (<code>prores</code> → <code>.mov</code>,
+  <code>hevc</code> → <code>.mp4</code>). If the user-supplied output path does not end in the expected
+  extension, print a warning and <strong>replace the extension</strong> (writing a single file at
+  the corrected path). Rationale: silently writing a codec into a mismatched container
+  confuses NLEs.</li>
+<li>Defaults may also be set in <code>config.toml</code> under the existing <code>[redact]</code> section
+  (<code>mode</code>, plus new <code>matte_feather</code> and <code>matte_codec</code>), consistent with how
+  <code>color</code>/<code>image</code> defaults work.</li>
+</ul>
+<h2 id="matte-rendering">Matte Rendering</h2>
+<p>For each output frame:</p>
+<ol>
+<li>Start from a black frame: <code>np.zeros((H, W, 3), np.uint8)</code>.</li>
+<li>For every final plate region for that frame — detections, predicted/gap-filled
+   boxes from the tracker, and the <code>--own-plate</code> fixed region — draw a filled white
+   rectangle: <code>cv2.rectangle(frame, (x1,y1), (x2,y2), (255,255,255), -1)</code>, using the
+   <strong>same padded coordinates</strong> the redactor computes. This is a drop-in substitution
+   at the point where blur/colour/image is currently applied.</li>
+<li>If <code>--matte-feather N &gt; 0</code>, apply <code>cv2.GaussianBlur</code> with a kernel derived from <code>N</code>
+   (odd kernel size, e.g. <code>k = 2*N+1</code>) to the whole matte.</li>
+</ol>
+<p>Because R=G=B for every pixel, the result is a clean luma matte with neutral chroma.</p>
+<h2 id="encode-path">Encode Path</h2>
+<p>Matte frames are synthetic, so this mode <strong>bypasses the FFV1 lossless intermediate
+and the <code>mux_audio()</code> step entirely</strong> — raw BGR frames pipe straight into a single
+encode. The encode is selected by <code>--matte-codec</code>; both paths write full-range
+(<code>-color_range pc</code>) so white encodes as true 255 for a clean key, and neither writes
+audio.</p>
+<h3 id="-matte-codec-prores-default"><code>--matte-codec prores</code> (default)</h3>
+<p>New helper <code>build_ffmpeg_encode_prores(width, height, fps, out_path)</code>.
+Prefer the hardware encoder when <code>prores_videotoolbox</code> is present in the ffmpeg build
+(probed the same way <code>mux_audio()</code> probes for <code>hevc_nvenc</code>); otherwise use <code>prores_ks</code>.</p>
+<p>Primary (hardware, Apple platforms):</p>
+<pre><code>ffmpeg -y -f rawvideo -pix_fmt bgr24 -s WxH -r FPS -i pipe:0 \
+  -c:v prores_videotoolbox -profile:v hq -pix_fmt yuv422p10le \
+  -color_range pc out.mov
+</code></pre>
+<p>Fallback (CPU, if the hardware encode returns non-zero):</p>
+<pre><code>ffmpeg -y -f rawvideo -pix_fmt bgr24 -s WxH -r FPS -i pipe:0 \
+  -c:v prores_ks -profile:v 3 -pix_fmt yuv422p10le \
+  -color_range pc out.mov
+</code></pre>
+<h3 id="-matte-codec-hevc-performance-escape-hatch"><code>--matte-codec hevc</code> (performance escape hatch)</h3>
+<p>New helper <code>build_ffmpeg_encode_hevc_matte(width, height, fps, out_path)</code>. Prefer
+<code>hevc_nvenc</code> (GPU, NVIDIA) when available — same probe as <code>mux_audio()</code> — otherwise
+<code>libx265</code> (CPU). Encoded near-lossless to keep matte edges crisp.</p>
+<p>Primary (GPU, NVIDIA):</p>
+<pre><code>ffmpeg -y -f rawvideo -pix_fmt bgr24 -s WxH -r FPS -i pipe:0 \
+  -c:v hevc_nvenc -rc vbr -cq 12 -preset p4 -tag:v hvc1 \
+  -pix_fmt yuv420p -color_range pc out.mp4
+</code></pre>
+<p>Fallback (CPU):</p>
+<pre><code>ffmpeg -y -f rawvideo -pix_fmt bgr24 -s WxH -r FPS -i pipe:0 \
+  -c:v libx265 -crf 12 -preset medium -tag:v hvc1 \
+  -pix_fmt yuv420p -color_range pc out.mp4
+</code></pre>
+<p>Both paths mirror the existing <code>hevc_nvenc → libx265</code> fallback pattern in
+<code>mux_audio()</code>. Progress reporting reuses <code>_ffmpeg_with_progress()</code>.</p>
+<p>The matte is frame-accurate to the source: same resolution, same fps, and it honours
+<code>--start</code>/<code>--end</code> trim so it aligns on the timeline. No audio is written (a matte
+needs none).</p>
+<h2 id="pipeline-integration">Pipeline Integration</h2>
+<ul>
+<li>One branch at the redaction site: when <code>mode == "matte"</code>, render the matte frame
+  instead of blurring/colour/image.</li>
+<li>One branch at the output/finalise stage: when <code>mode == "matte"</code>, route to the encoder
+  selected by <code>--matte-codec</code> (<code>build_ffmpeg_encode_prores()</code> or
+  <code>build_ffmpeg_encode_hevc_matte()</code>) and pipe frames directly, skipping the FFV1
+  intermediate and <code>mux_audio()</code>. All upstream decode/detect/track code is untouched.</li>
+</ul>
+<h2 id="testing">Testing</h2>
+<ul>
+<li><strong>Unit — renderer:</strong> given a set of boxes with <code>feather=0</code>, assert white pixels
+  exactly inside the padded boxes and black elsewhere; with <code>feather&gt;0</code>, assert a soft
+  falloff at the edges (intermediate grey values present).</li>
+<li><strong>Smoke — encode:</strong> pipe 2–3 synthetic frames through each codec path and assert
+  <code>ffprobe</code> reports the expected codec (<code>prores</code> for <code>.mov</code>, <code>hevc</code> for <code>.mp4</code>) with the
+  expected dimensions/fps. Exercise the CPU fallback branch (<code>prores_ks</code> / <code>libx265</code>) as
+  well, since CI typically lacks the hardware/GPU encoders.</li>
+<li><strong>Manual — end-to-end:</strong> run <code>--mode matte</code> on a short clip for each codec; confirm the
+  output opens, reports the right codec, and the white regions align with the plates.
+  Verify in an NLE that the matte keys cleanly (white = fully affected).</li>
+</ul>
+<h2 id="non-goals-deferred">Non-Goals / Deferred</h2>
+<ul>
+<li><strong>JSON sidecar (Approach C):</strong> decoupling detection from matte rendering so feather /
+  padding can be re-rendered without re-detecting. Deferred until there's a real need
+  to iterate on the matte without re-running the (slow) SAHI detection.</li>
+<li><strong>Alpha / ProRes 4444 matte:</strong> not needed for a luma-matte workflow.</li>
+<li><strong>Baked-in blur alongside the matte:</strong> out of scope; matte mode outputs only the matte.</li>
+</ul>
+<h2 id="platform-notes">Platform Notes</h2>
+<p><strong>ProRes has no GPU encoder on PC.</strong> Hardware ProRes <em>encode</em> exists only on Apple
+Silicon (the dedicated media/ProRes engine, used via <code>prores_videotoolbox</code>). On
+Windows/Linux there is no GPU path:</p>
+<ul>
+<li><strong>NVENC / AMD VCN / Intel QuickSync</strong> are fixed-function encoders limited to H.264,
+  HEVC, and AV1 — ProRes is not in their silicon.</li>
+<li><strong>CUDA</strong> is general-purpose compute and <em>could</em> in principle run a ProRes encoder,
+  but no usable one exists (ffmpeg ships only the CPU <code>prores_ks</code> / <code>prores_aw</code>). The
+  gap is largely non-technical: ProRes is Apple-proprietary and certified ProRes
+  encoders are tightly controlled (hence sanctioned implementations from Apple,
+  Blackmagic/Resolve on Windows, and capture-card ASICs — but nothing droppable into
+  ffmpeg).</li>
+</ul>
+<p><strong>Consequence:</strong> on PC, <code>--matte-codec prores</code> runs on the CPU via <code>prores_ks</code>. For a
+flat luma matte that is cheap, so most users won't notice. Users who <em>do</em> need GPU
+acceleration (e.g. long 4K jobs on an NVIDIA box) can switch to <code>--matte-codec hevc</code>,
+which uses <code>hevc_nvenc</code> — accepting a near-lossless HEVC/<code>.mp4</code> matte instead of ProRes.
+Because a luma matte carries its signal in luma with neutral chroma, this trade is
+visually negligible for keying.</p>
+<h2 id="performance-note">Performance Note</h2>
+<p>Because the matte skips the lossless FFV1 intermediate and encodes near-empty frames
+(hardware ProRes where available, else CPU <code>prores_ks</code>; or <code>hevc_nvenc</code>/<code>libx265</code> for
+<code>--matte-codec hevc</code>), a matte run is expected to be <strong>faster</strong> than an equivalent blur
+run — the dominant cost remains SAHI plate detection, which is unchanged.</p></body></html>
